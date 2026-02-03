@@ -207,25 +207,42 @@ class EvaluationTracker:
         try:
             summary = evaluation_report.get('summary', {})
 
-            # Log only top-level aggregate metrics (appeval_100 + 2-3 key metrics)
+            # Log total apps
             total_apps = summary.get('total_apps', 0)
             if total_apps > 0:
                 mlflow.log_metric("total_apps", total_apps)
+
+            # Log ALL metrics from metrics_summary prominently
+            metrics_summary = summary.get('metrics_summary', {})
+            for key, value in metrics_summary.items():
+                if value is not None:
+                    # Convert to float for MLflow
+                    try:
+                        mlflow.log_metric(key, float(value))
+                    except (ValueError, TypeError):
+                        pass  # Skip non-numeric values
 
             # Log template distribution metrics
             template_dist = summary.get('template_distribution', {})
             for template_name, count in template_dist.items():
                 mlflow.log_metric(f"template_{template_name}_count", count)
 
-            # Log average scores from individual apps
+            # Log generation metrics if present
+            gen_metrics = summary.get('generation_metrics', {})
+            for key, value in gen_metrics.items():
+                if value is not None:
+                    try:
+                        mlflow.log_metric(f"gen_{key}", float(value))
+                    except (ValueError, TypeError):
+                        pass
+
+            # Fallback: compute avg_appeval_100 from apps if not in summary
             apps = evaluation_report.get('apps', [])
-            if apps:
-                # Average appeval_100 composite score (PRIMARY METRIC)
+            if apps and 'avg_appeval_100' not in metrics_summary:
                 avg_appeval_100 = sum(app['metrics'].get('appeval_100', 0)
                                      for app in apps) / len(apps)
                 mlflow.log_metric("avg_appeval_100", avg_appeval_100)
 
-                # Average eff_units efficiency metric (lower is better)
                 eff_values = [app['metrics'].get('eff_units') for app in apps
                              if app.get('metrics', {}).get('eff_units') is not None]
                 if eff_values:
