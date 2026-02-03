@@ -78,7 +78,7 @@ class MCPSession:
 
 
 class LiteLLMAgent:
-    # Local file operation tools (not from MCP)
+    # Local tools (not from MCP)
     LOCAL_TOOLS = [
         {
             "type": "function",
@@ -122,6 +122,21 @@ class LiteLLMAgent:
                         "new_string": {"type": "string", "description": "Replacement string"},
                     },
                     "required": ["file_path", "old_string", "new_string"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute a bash command. Use for npm, git, mkdir, etc.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Bash command to execute"},
+                        "working_directory": {"type": "string", "description": "Directory to run command in"},
+                    },
+                    "required": ["command"],
                 },
             },
         },
@@ -305,7 +320,9 @@ class LiteLLMAgent:
         )
 
     async def _execute_local_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
-        """Execute a local file operation tool."""
+        """Execute a local tool."""
+        import subprocess
+
         if tool_name == "read_file":
             file_path = Path(arguments["file_path"])
             if not file_path.exists():
@@ -335,11 +352,34 @@ class LiteLLMAgent:
             file_path.write_text(new_content)
             return f"Successfully edited {file_path}"
 
+        elif tool_name == "bash":
+            command = arguments["command"]
+            cwd = arguments.get("working_directory", str(self.app_dir.parent) if self.app_dir else ".")
+            try:
+                result = subprocess.run(
+                    command,
+                    shell=True,
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                output = result.stdout + result.stderr
+                if len(output) > 30000:
+                    output = output[:30000] + "\n[Output truncated]"
+                if result.returncode != 0:
+                    return f"Command failed (exit {result.returncode}):\n{output}"
+                return output if output else f"Command succeeded (exit 0)"
+            except subprocess.TimeoutExpired:
+                return "Error: Command timed out after 120 seconds"
+            except Exception as e:
+                return f"Error executing command: {e}"
+
         return f"Error: Unknown local tool: {tool_name}"
 
     async def _execute_tools(self, tool_calls) -> list[dict[str, Any]]:
         results = []
-        local_tool_names = {"read_file", "write_file", "edit_file"}
+        local_tool_names = {"read_file", "write_file", "edit_file", "bash"}
 
         for tc in tool_calls:
             tool_name = tc.function.name
@@ -410,10 +450,11 @@ class LiteLLMAppBuilder:
 - **invoke_databricks_cli**: Execute CLI commands for scaffolding
 - **read_skill_file**: Read skills for domain guidance
 
-### File Operation Tools (local)
+### Local Tools (file ops and shell)
 - **read_file**: Read file contents (file_path)
 - **write_file**: Write content to file (file_path, content)
 - **edit_file**: Replace old_string with new_string in file (file_path, old_string, new_string)
+- **bash**: Execute shell command (command, working_directory) - use for npm, mkdir, etc.
 
 ## IMPORTANT NAMING RULES
 - App names MUST use underscores, not hyphens: "sales_dashboard" NOT "sales-dashboard"
@@ -451,10 +492,11 @@ write_file(
 )
 ```
 
-## What NOT to do
-- Do NOT use shell commands via invoke_databricks_cli (no cat, echo, mkdir)
-- ONLY use invoke_databricks_cli for init-template scaffolding
-- Use read_file/write_file/edit_file for ALL file operations"""
+## Tool Usage Rules
+- Use invoke_databricks_cli ONLY for init-template scaffolding and databricks queries
+- Use bash for shell commands (mkdir, npm, etc.)
+- Use read_file/write_file/edit_file for file operations
+- Do NOT use invoke_databricks_cli for shell commands (no bash -c, no cat, no echo)"""
         else:
             return """You are an AI assistant that builds Databricks data applications.
 
