@@ -73,27 +73,47 @@ class EvaluationTracker:
                 print(f"⚠️  MLflow cluster auto-auth failed: {e}")
                 # Fall through to try env var auth
 
-        # Fall back to env var authentication
-        if not host or not token:
-            print("⚠️  MLflow tracking disabled: DATABRICKS_HOST or DATABRICKS_TOKEN not set (and not on Databricks cluster)")
-            return
+        # Try PAT auth if credentials provided
+        if host and token:
+            try:
+                # Ensure protocol is present
+                if not host.startswith('https://'):
+                    host = f'https://{host}'
 
+                # Set tracking URI to Databricks
+                mlflow.set_tracking_uri("databricks")
+
+                # Configure authentication
+                os.environ['DATABRICKS_HOST'] = host
+                os.environ['DATABRICKS_TOKEN'] = token
+
+                # Create client
+                self.client = MlflowClient()
+
+                # Get or create experiment
+                try:
+                    experiment = self.client.get_experiment_by_name(self.experiment_name)
+                    if not experiment:
+                        self.client.create_experiment(self.experiment_name)
+                except Exception:
+                    self.client.create_experiment(self.experiment_name)
+
+                mlflow.set_experiment(experiment_name=self.experiment_name)
+
+                self.enabled = True
+                print(f"✓ MLflow tracking enabled (PAT auth): {self.experiment_name}")
+                return
+
+            except Exception as e:
+                print(f"⚠️  MLflow PAT auth failed: {e}, trying OAuth...")
+                # Fall through to try OAuth
+
+        # Try OAuth/databricks-cli auth via unified SDK auth
         try:
-            # Ensure protocol is present
-            if not host.startswith('https://'):
-                host = f'https://{host}'
-
-            # Set tracking URI to Databricks
             mlflow.set_tracking_uri("databricks")
-
-            # Configure authentication
-            os.environ['DATABRICKS_HOST'] = host
-            os.environ['DATABRICKS_TOKEN'] = token
-
-            # Create client
             self.client = MlflowClient()
 
-            # Get or create experiment
+            # Get or create experiment (this validates auth works)
             try:
                 experiment = self.client.get_experiment_by_name(self.experiment_name)
                 if not experiment:
@@ -104,7 +124,7 @@ class EvaluationTracker:
             mlflow.set_experiment(experiment_name=self.experiment_name)
 
             self.enabled = True
-            print(f"✓ MLflow tracking enabled: {self.experiment_name}")
+            print(f"✓ MLflow tracking enabled (OAuth): {self.experiment_name}")
 
         except Exception as e:
             print(f"⚠️  MLflow setup failed: {e}")
