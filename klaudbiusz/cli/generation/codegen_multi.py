@@ -294,7 +294,9 @@ class LiteLLMAppBuilder:
         suppress_logs: bool = False,
         output_dir: str | None = None,
     ):
-        self.app_name = app_name
+        # Convert hyphens to underscores for Databricks CLI compatibility
+        # The init-template command requires names with underscores only
+        self.app_name = app_name.replace("-", "_")
         self.model = model
         self.mcp_binary = mcp_binary
         self.mcp_json_path = mcp_json_path
@@ -318,29 +320,36 @@ class LiteLLMAppBuilder:
 ## CRITICAL: You MUST create actual app files!
 Do NOT just describe what you would do. Actually scaffold and create the application.
 
+## IMPORTANT NAMING RULES
+- App names MUST use underscores, not hyphens: "sales_dashboard" NOT "sales-dashboard"
+- This is required by the template system
+
 ## Workflow
 1. Call databricks_discover first - it provides the default warehouse ID
 2. Get warehouse ID using: invoke_databricks_cli(args=["experimental", "aitools", "tools", "get-default-warehouse"], working_directory=".")
-3. Scaffold the app:
+3. The "App directory" in your prompt is where you should create the app. Use its PARENT directory as working_directory for init-template.
+4. Scaffold the app (use underscore naming!):
    invoke_databricks_cli(
-     args=["experimental", "aitools", "tools", "init-template", "app", "--name", "APP_NAME", "--warehouse", "WAREHOUSE_ID"],
-     working_directory="/path/to/output"
+     args=["experimental", "aitools", "tools", "init-template", "app", "--name", "app_name_with_underscores", "--warehouse", "WAREHOUSE_ID"],
+     working_directory="/parent/directory/of/app"
    )
-4. The scaffolded app will have: package.json, schema.ts, client/, server/, config/queries/
-5. Modify SQL queries in config/queries/ and schema.ts for the use case
-6. Run `npm run typegen` after schema changes
+5. The scaffolded app will have: package.json, schema.ts, databricks.yml, client/, server/, config/queries/
+6. Modify SQL queries in config/queries/ and schema.ts for the use case
+7. Run `npm run typegen` after schema changes
 
 ## Example
-```python
-# Get warehouse ID
+If App directory is /tmp/apps/my_app, then:
+```
+# Get warehouse ID first
 result = invoke_databricks_cli(args=["experimental", "aitools", "tools", "get-default-warehouse"], working_directory=".")
 warehouse_id = result.strip()
 
-# Scaffold app
+# Scaffold into PARENT directory /tmp/apps with name my_app
 invoke_databricks_cli(
-  args=["experimental", "aitools", "tools", "init-template", "app", "--name", "sales-dashboard", "--warehouse", warehouse_id],
+  args=["experimental", "aitools", "tools", "init-template", "app", "--name", "my_app", "--warehouse", warehouse_id],
   working_directory="/tmp/apps"
 )
+# This creates /tmp/apps/my_app/ with all the app files
 ```
 
 IMPORTANT: You MUST scaffold first, then modify files. Never skip scaffolding!"""
@@ -401,6 +410,9 @@ Be concise and to the point."""
                 suppress_logs=self.suppress_logs,
             )
             await agent.initialize()
+
+            # Ensure output directory exists (parent of app_dir)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
 
             # compute absolute path for MCP tool (scaffold_data_app requires absolute path)
             app_dir = self.output_dir / self.app_name
