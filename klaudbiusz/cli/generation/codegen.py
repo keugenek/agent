@@ -87,22 +87,28 @@ class ClaudeAppBuilder:
         await self.tracker.init(wipe_db=self.wipe_db)
 
         # Use MCP tools directly if mcp_binary is provided, otherwise fall back to skills
+        # Log mode for debugging
         if self.mcp_binary:
+            logger.info(f"Mode: MCP (binary: {self.mcp_binary}, args: {self.mcp_args})")
             base_instructions = """Use the mcp__edda__scaffold_data_app tool to scaffold the app.
 Use the mcp__edda__databricks_* tools to explore data in Databricks when relevant.
 Be concise and to the point in your responses.
 Use up to 10 tools per call to speed up the process.
 Never deploy the app, just scaffold and build it.
 """
+            # MCP mode: allow mcp__edda__ tools
+            disallowed_tools = ["NotebookEdit", "WebSearch", "WebFetch"]
         else:
+            logger.info("Mode: Skills (no MCP binary configured)")
             base_instructions = """Use /databricks-apps skill to scaffold, build, and test the app.
 Use /databricks skill to explore data in Databricks when relevant.
 Be concise and to the point in your responses.
 Use up to 10 tools per call to speed up the process.
 Never deploy the app, just scaffold and build it.
+IMPORTANT: Do NOT use mcp__edda__* tools - they are not available. Use skills instead.
 """
-
-        disallowed_tools = ["NotebookEdit", "WebSearch", "WebFetch"]
+            # Skills mode: ban mcp__edda__ tools to prevent confusion
+            disallowed_tools = ["NotebookEdit", "WebSearch", "WebFetch", "mcp__edda__databricks_discover", "mcp__edda__invoke_databricks_cli", "mcp__edda__scaffold_data_app", "mcp__edda__databricks_configure_auth", "mcp__edda__databricks_query_sdk_docs", "mcp__edda__read_skill_file"]
 
         # When running as root (e.g., Databricks clusters), the CLI's
         # --dangerously-skip-permissions flag doesn't work by default.
@@ -115,7 +121,7 @@ Never deploy the app, just scaffold and build it.
             env_vars["IS_SANDBOX"] = "1"
 
         # Configure MCP server if binary is provided
-        mcp_servers: dict[str, dict[str, object]] = {}
+        mcp_servers = {}
         if self.mcp_binary:
             logger.info(f"Configuring MCP server: {self.mcp_binary} {self.mcp_args}")
             mcp_servers["edda"] = {
@@ -132,7 +138,7 @@ Never deploy the app, just scaffold and build it.
             },
             permission_mode="bypassPermissions",
             env=env_vars,
-            mcp_servers=mcp_servers if mcp_servers else {},
+            mcp_servers=mcp_servers,  # type: ignore[arg-type]
             disallowed_tools=disallowed_tools,
             setting_sources=["user", "project"],
             max_turns=75,
