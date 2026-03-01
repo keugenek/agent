@@ -18,6 +18,7 @@ Usage:
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -30,7 +31,7 @@ from dotenv import load_dotenv
 from cli.evaluation.eval_agent import EvalAgent
 from cli.evaluation.eval_checks import check_databricks_connectivity as _check_db_connectivity, extract_sql_queries
 from cli.evaluation.eval_metrics import calculate_appeval_100, eff_units
-from cli.utils.template_detection import detect_template
+from cli.utils.template_detection import detect_template, get_actual_app_dir
 
 # Add the cli directory to Python path for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -231,19 +232,7 @@ async def check_build_success(agent: EvalAgent, app_dir: Path, template: str = "
 
     dockerfile = app_dir / "Dockerfile"
     has_dockerfile = dockerfile.exists()
-
-    if has_dockerfile:
-        # Docker-based build - still use subprocess for Docker
-        success, _stdout, _stderr = run_command(
-            ["docker", "build", "-t", f"eval-{app_dir.name}", "."],
-            cwd=str(app_dir),
-            timeout=300,
-        )
-        build_time = time.time() - start_time
-        return success, {"build_time_sec": round(build_time, 1), "has_dockerfile": True}
-
-    # Non-Docker build: use agent to run build
-    success, output = await agent.build()
+    success, output = await agent.build(app_kind=template)
     build_time = time.time() - start_time
 
     if not success and output:
@@ -251,7 +240,7 @@ async def check_build_success(agent: EvalAgent, app_dir: Path, template: str = "
         for line in output.strip().split('\n')[:3]:
             print(f"       {line}")
 
-    return success, {"build_time_sec": round(build_time, 1), "has_dockerfile": False}
+    return success, {"build_time_sec": round(build_time, 1), "has_dockerfile": has_dockerfile}
 
 
 def _prepare_runtime_env(app_dir: Path, container_name: str = "", port: int = 8000) -> dict[str, str]:
@@ -319,54 +308,14 @@ async def check_runtime_success(agent: EvalAgent, app_dir: Path, container_name:
     # Clean up any existing processes/containers before starting
     await _stop_app(agent, app_dir, template, port)
 
-    dockerfile = app_dir / "Dockerfile"
-
     try:
-        # Docker builds still use scripts directly
-        if dockerfile.exists():
-            # Get Docker-specific start script
-            start_script = Path(__file__).parent.parent / "eval" / "docker" / "start.sh"
-            if not start_script.exists():
-                print(f"  ⚠️  Start script not found: {start_script}")
-                return False, {}
-
-            # Prepare environment variables
-            env = _prepare_runtime_env(app_dir, container_name, port)
-            if not env.get("DATABRICKS_HOST") or not env.get("DATABRICKS_TOKEN"):
-                print("  ⚠️  Missing DATABRICKS_HOST or DATABRICKS_TOKEN")
-                return False, {}
-
-            # Run Docker start script
-            start_time = time.time()
-            success, _, stderr = run_command(
-                ["bash", str(start_script)],
-                cwd=str(app_dir),
-                env=env,
-                timeout=30,
-            )
-            startup_time = time.time() - start_time
-
-            # Cleanup unless keep_running requested
-            if not keep_running or not success:
-                await _stop_app(agent, app_dir, template, port)
-
-            if success:
-                return True, {"startup_time_sec": round(startup_time, 1)}
-            else:
-                if stderr:
-                    print("  ⚠️  Startup failed:")
-                    for line in stderr.strip().split('\n')[:5]:
-                        print(f"    {line}")
-                return False, {}
-
-        # Non-Docker: use agent to start and health check
         env = _prepare_runtime_env(app_dir, container_name, port)
         if not _is_databricks_auth_available():
             print("  ⚠️  Databricks auth not available")
             return False, {}
 
         start_time = time.time()
-        success, output = await agent.start(port=port)
+        success, output = await agent.start(port=port, app_kind=template)
         startup_time = time.time() - start_time
 
         # Cleanup unless keep_running requested
@@ -392,21 +341,7 @@ async def check_runtime_success(agent: EvalAgent, app_dir: Path, container_name:
 async def _stop_app(agent: EvalAgent, app_dir: Path, template: str = "unknown", port: int = 8000) -> bool:
     """Stop app using the evaluation agent."""
     try:
-        # Docker apps still use script for container cleanup
-        dockerfile = app_dir / "Dockerfile"
-        if dockerfile.exists():
-            stop_script = Path(__file__).parent.parent / "eval" / "docker" / "stop.sh"
-            if stop_script.exists():
-                success, _, _ = run_command(
-                    ["bash", str(stop_script)],
-                    cwd=str(app_dir),
-                    timeout=10,
-                )
-                time.sleep(1)
-                return success
-
-        # Non-Docker: use agent to stop processes
-        success, _ = await agent.stop(port=port)
+        success, _ = await agent.stop(port=port, app_kind=template)
         time.sleep(1)  # Give the OS time to release resources
         return success
 
@@ -428,7 +363,7 @@ async def install_dependencies(agent: EvalAgent, app_dir: Path, template: str = 
     """Install npm dependencies using the evaluation agent."""
     print("  [0/7] Installing dependencies...")
 
-    success, output = await agent.install_dependencies()
+    success, output = await agent.install_dependencies(app_kind=template)
 
     if success:
         print("    ✅ Dependencies installed")
@@ -448,7 +383,7 @@ async def check_type_safety(agent: EvalAgent, app_dir: Path, template: str = "un
     """
     print("  [3/7] Checking type safety...")
 
-    success, output = await agent.typecheck()
+    success, output = await agent.typecheck(app_kind=template)
 
     if not success and output:
         print("  ⚠️  Type errors found")
@@ -478,7 +413,7 @@ async def check_tests_pass(agent: EvalAgent, app_dir: Path, template: str = "unk
         has_tests = len(test_files) > 0
 
     # Run tests using agent
-    success, output = await agent.test()
+    success, output = await agent.test(app_kind=template)
 
     # Parse coverage from output
     coverage_pct = 0.0
@@ -639,6 +574,231 @@ Respond with ONLY one word: PASS or FAIL""",
 
     except Exception as e:
         return False, f"VLM check failed: {str(e)}"
+
+
+def _agentic_status_from_output(output: str) -> bool | None:
+    """Parse STATUS: PASS|FAIL marker from agent output.
+
+    Accepts markdown wrappers and inline variants, e.g.:
+    - STATUS: PASS
+    - **STATUS: FAIL**
+    - Final verdict -> STATUS: PASS
+    """
+    pattern = re.compile(r"STATUS\s*:\s*(PASS|FAIL)", re.IGNORECASE)
+    matches: list[bool] = []
+    for line in output.splitlines():
+        match = pattern.search(line)
+        if match:
+            matches.append(match.group(1).upper() == "PASS")
+    if matches:
+        return matches[-1]
+    return None
+
+
+def _format_agentic_attempt_line(
+    run_idx: int,
+    passed: bool,
+    stats: dict[str, int | None],
+    total_runs: int = 3,
+) -> str:
+    """Render one attempt line with pass/fail, tokens, and turns."""
+    turns = stats.get("turns")
+    input_tokens = stats.get("input_tokens")
+    output_tokens = stats.get("output_tokens")
+    turns_str = str(turns) if turns is not None else "n/a"
+    in_tok_str = str(input_tokens) if input_tokens is not None else "n/a"
+    out_tok_str = str(output_tokens) if output_tokens is not None else "n/a"
+    status = "PASS" if passed else "FAIL"
+    return (
+        f"{status} run {run_idx}/{total_runs} "
+        f"(turns={turns_str}, input_tokens={in_tok_str}, output_tokens={out_tok_str})"
+    )
+
+
+def _extract_failure_line(output: str) -> str:
+    """Extract a meaningful failure line from agent output."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return "No output"
+    # Prefer lines with letters and common error words.
+    for line in reversed(lines):
+        low = line.lower()
+        if any(word in low for word in ["error", "fail", "exception", "traceback", "status"]):
+            return line[:400]
+    for line in reversed(lines):
+        if re.search(r"[a-zA-Z]", line):
+            return line[:400]
+    return lines[-1][:400]
+
+
+def _infer_agentic_pass(
+    output: str,
+    parsed_status: bool | None,
+    sdk_success: bool,
+    metric_kind: str,
+) -> bool:
+    """Infer pass/fail with metric-specific fallbacks when STATUS is missing."""
+    if parsed_status is not None:
+        return parsed_status is True and sdk_success
+
+    low = output.lower()
+    # Fallback for UI/runability where explicit 200 evidence is acceptable.
+    if metric_kind in {"runability", "ui_renders"}:
+        if "http_code: 200" in low or "http 200" in low:
+            has_error_markers = any(
+                marker in low for marker in ["traceback", "exception", "status: fail", "error:"]
+            )
+            if not has_error_markers:
+                return True
+    return False
+
+
+async def check_local_runability_agentic(
+    agent: EvalAgent,
+    app_dir: Path,
+    template: str,
+    port: int = 8000,
+) -> tuple[int, list[str]]:
+    """Metric 8 (agentic): simple prompt proves app can run locally."""
+    print("  [8/9] Checking local runability (agentic)...")
+    attempt_lines: list[str] = []
+    all_passed = True
+    last_failure_output = ""
+
+    for i in range(1, 4):
+        success, output, stats = await agent.runability_with_stats(
+            port=port,
+            app_kind=template,
+        )
+        parsed = _agentic_status_from_output(output)
+        passed = _infer_agentic_pass(output, parsed, success, "runability")
+        attempt_lines.append(_format_agentic_attempt_line(i, passed, stats, total_runs=3))
+        if not passed:
+            all_passed = False
+            if output.strip():
+                last_failure_output = _extract_failure_line(output)[:300]
+            elif parsed is None:
+                last_failure_output = "No STATUS marker in agent output"
+
+    if all_passed:
+        return 5, ["✓ Agentic runability check passed (3/3 runs)"] + attempt_lines
+
+    details = ["✗ Agentic runability check failed (requires 3/3 passes)"] + attempt_lines
+    if last_failure_output:
+        details.append(f"✗ Last failure output: {last_failure_output}")
+    return 0, details
+
+
+async def check_deployability_agentic(
+    agent: EvalAgent,
+    app_dir: Path,
+    template: str,
+    port: int = 8010,
+) -> tuple[int, list[str]]:
+    """Metric 9 (agentic): simple prompt proves app can be deployed."""
+    print("  [9/9] Checking deployability (agentic)...")
+    attempt_lines: list[str] = []
+    all_passed = True
+    last_failure_output = ""
+
+    for i in range(1, 4):
+        success, output, stats = await agent.deployability_with_stats(
+            port=port,
+            app_kind=template,
+        )
+        parsed = _agentic_status_from_output(output)
+        passed = _infer_agentic_pass(output, parsed, success, "deployability")
+        attempt_lines.append(_format_agentic_attempt_line(i, passed, stats, total_runs=3))
+        if not passed:
+            all_passed = False
+            if output.strip():
+                last_failure_output = _extract_failure_line(output)[:300]
+            elif parsed is None:
+                last_failure_output = "No STATUS marker in agent output"
+
+    if all_passed:
+        return 5, ["✓ Agentic deployability check passed (3/3 runs)"] + attempt_lines
+
+    details = ["✗ Agentic deployability check failed (requires 3/3 passes)"] + attempt_lines
+    if last_failure_output:
+        details.append(f"✗ Last failure output: {last_failure_output}")
+    return 0, details
+
+
+async def check_data_returned_agentic(
+    agent: EvalAgent,
+    app_dir: Path,
+    template: str,
+    port: int = 8000,
+) -> tuple[bool, str]:
+    """Metric 6 (agentic): verify real Databricks-backed data, not mocks."""
+    print("  [6/7] Checking data returned (agentic)...")
+    attempt_lines: list[str] = []
+    all_passed = True
+    last_failure_output = ""
+
+    for i in range(1, 4):
+        success, output, stats = await agent.data_returned_with_stats(
+            port=port,
+            app_kind=template,
+        )
+        parsed = _agentic_status_from_output(output)
+        passed = _infer_agentic_pass(output, parsed, success, "data_returned")
+        attempt_lines.append(_format_agentic_attempt_line(i, passed, stats, total_runs=3))
+        if not passed:
+            all_passed = False
+            if output.strip():
+                last_failure_output = _extract_failure_line(output)[:400]
+            elif parsed is None:
+                last_failure_output = "No STATUS marker in agent output"
+
+    prefix = (
+        "Agentic SQL-to-endpoint parity check passed (3/3 runs)"
+        if all_passed
+        else "Agentic SQL-to-endpoint parity check failed (requires 3/3 passes)"
+    )
+    detail_text = "; ".join(attempt_lines)
+    if not all_passed and last_failure_output:
+        detail_text = f"{detail_text}; last_failure={last_failure_output}"
+    return all_passed, f"{prefix}. {detail_text}"
+
+
+async def check_databricks_connectivity_agentic(
+    agent: EvalAgent,
+    app_dir: Path,
+    template: str,
+    port: int = 8000,
+) -> tuple[bool, str]:
+    """Metric 5 (agentic): verify Databricks connectivity through app endpoints."""
+    print("  [5/7] Checking Databricks connectivity (agentic)...")
+    success, output, stats = await agent.db_connectivity_with_stats(port=port, app_kind=template)
+    parsed = _agentic_status_from_output(output)
+    passed = _infer_agentic_pass(output, parsed, success, "db_connectivity")
+    detail = _format_agentic_attempt_line(1, passed, stats, total_runs=1)
+    if passed:
+        return True, detail
+    if output.strip():
+        return False, f"{detail}; last_failure={_extract_failure_line(output)[:300]}"
+    return False, f"{detail}; last_failure=No STATUS marker in agent output"
+
+
+async def check_ui_renders_agentic(
+    agent: EvalAgent,
+    app_dir: Path,
+    template: str,
+    port: int = 8000,
+) -> tuple[bool, str]:
+    """Metric 7 (agentic): verify UI renders without obvious errors."""
+    print("  [7/7] Checking UI renders (agentic)...")
+    success, output, stats = await agent.ui_renders_with_stats(port=port, app_kind=template)
+    parsed = _agentic_status_from_output(output)
+    passed = _infer_agentic_pass(output, parsed, success, "ui_renders")
+    detail = _format_agentic_attempt_line(1, passed, stats, total_runs=1)
+    if passed:
+        return True, detail
+    if output.strip():
+        return False, f"{detail}; last_failure={_extract_failure_line(output)[:300]}"
+    return False, f"{detail}; last_failure=No STATUS marker in agent output"
 
 
 def check_local_runability(app_dir: Path, template: str = "unknown") -> tuple[int, list[str]]:
@@ -809,9 +969,14 @@ async def evaluate_app(app_dir: Path, prompt: str | None = None, port: int = 800
     print(f"\nEvaluating: {app_dir.name}")
     print("=" * 60)
 
+    # Resolve nested app roots so checks run in the correct folder.
+    resolved_app_dir = get_actual_app_dir(app_dir)
+
     # Detect template type
-    template = detect_template(app_dir)
+    template = detect_template(resolved_app_dir)
     print(f"  Template: {template}")
+    if resolved_app_dir != app_dir:
+        print(f"  Resolved app dir: {resolved_app_dir}")
 
     metrics = FullMetrics()
     metrics.template_type = template
@@ -822,17 +987,17 @@ async def evaluate_app(app_dir: Path, prompt: str | None = None, port: int = 800
     runtime_success = False  # Initialize to avoid UnboundLocalError
 
     # Prepare environment variables for runtime checks
-    runtime_env = _prepare_runtime_env(app_dir, container_name, port)
+    runtime_env = _prepare_runtime_env(resolved_app_dir, container_name, port)
 
     # Create evaluation agent for this app
-    agent = EvalAgent(app_dir, model="haiku", suppress_logs=True, env=runtime_env)
+    agent = EvalAgent(resolved_app_dir, model="haiku", suppress_logs=True, env=runtime_env)
 
     try:
         # Install dependencies first (needed for TypeScript and tests)
-        deps_installed = await install_dependencies(agent, app_dir, template)
+        deps_installed = await install_dependencies(agent, resolved_app_dir, template)
 
         # Metric 1: Build
-        build_success, build_meta = await check_build_success(agent, app_dir, template)
+        build_success, build_meta = await check_build_success(agent, resolved_app_dir, template)
         metrics.build_success = build_success
         metrics.build_time_sec = build_meta.get("build_time_sec", 0.0)
         metrics.has_dockerfile = build_meta.get("has_dockerfile", False)
@@ -844,7 +1009,9 @@ async def evaluate_app(app_dir: Path, prompt: str | None = None, port: int = 800
 
         # Metric 2: Runtime (always try, not just if build succeeded)
         # Keep app running for screenshot capture
-        runtime_success, runtime_meta = await check_runtime_success(agent, app_dir, container_name, template, port, keep_running=True)
+        runtime_success, runtime_meta = await check_runtime_success(
+            agent, resolved_app_dir, container_name, template, port, keep_running=True
+        )
         metrics.runtime_success = runtime_success
         metrics.startup_time_sec = runtime_meta.get("startup_time_sec", 0.0)
         if not runtime_success:
@@ -857,27 +1024,47 @@ async def evaluate_app(app_dir: Path, prompt: str | None = None, port: int = 800
         if runtime_success:
             # Capture screenshot for UI check (app must still be running)
             print("  [3/9] Capturing screenshot...")
-            await capture_screenshot_local(app_dir, port)
+            await capture_screenshot_local(resolved_app_dir, port)
 
             # Metric 5: Databricks connectivity (check while app is running)
-            print("  [4/9] Checking Databricks connectivity...")
-            db_success = check_databricks_connectivity(app_dir, template, port)
+            db_success, db_details = await check_databricks_connectivity_agentic(
+                agent,
+                resolved_app_dir,
+                template,
+                port,
+            )
             metrics.databricks_connectivity = db_success
+            details["databricks_connectivity_agentic"] = [db_details]
             if not db_success:
                 issues.append("Databricks connectivity failed")
+            else:
+                # Metric 6: Data returned (agentic SQL/endpoint parity)
+                data_returned, data_details = await check_data_returned_agentic(
+                    agent, resolved_app_dir, template, port
+                )
+                metrics.data_returned = data_returned
+                details["data_returned_agentic"] = [data_details]
+                if not data_returned:
+                    issues.append(f"Data validity concerns: {data_details}")
 
             # Stop the app now - we have the screenshot
-            await _stop_app(agent, app_dir, template, port)
+            await _stop_app(agent, resolved_app_dir, template, port)
 
             # Metric 7: UI functional (VLM - binary check on captured screenshot)
-            ui_renders, ui_details = check_ui_functional_vlm(app_dir, prompt)
+            ui_renders, ui_details = await check_ui_renders_agentic(
+                agent,
+                resolved_app_dir,
+                template,
+                port,
+            )
             metrics.ui_renders = ui_renders
+            details["ui_renders_agentic"] = [ui_details]
             if not ui_renders:
                 issues.append(f"UI concerns: {ui_details}")
 
         # Metric 3: Type safety (requires dependencies)
         if deps_installed:
-            type_safety = await check_type_safety(agent, app_dir, template)
+            type_safety = await check_type_safety(agent, resolved_app_dir, template)
             metrics.type_safety = type_safety
             # Only flag TS errors as issues if they cause build/runtime problems
             # (Since apps use tsx which skips type checking, TS strictness is informational)
@@ -888,7 +1075,9 @@ async def evaluate_app(app_dir: Path, prompt: str | None = None, port: int = 800
 
         # Metric 4: Tests (requires dependencies)
         if deps_installed:
-            tests_pass, coverage, has_tests = await check_tests_pass(agent, app_dir, template)
+            tests_pass, coverage, has_tests = await check_tests_pass(
+                agent, resolved_app_dir, template
+            )
             metrics.tests_pass = tests_pass
             metrics.test_coverage_pct = coverage
             metrics.has_tests = has_tests
@@ -898,14 +1087,18 @@ async def evaluate_app(app_dir: Path, prompt: str | None = None, port: int = 800
                 issues.append(f"Test coverage below 70% ({coverage:.1f}%)")
 
         # Metric 8: Local runability (DevX)
-        local_score, local_details = check_local_runability(app_dir, template)
+        local_score, local_details = await check_local_runability_agentic(
+            agent, resolved_app_dir, template, port=port
+        )
         metrics.local_runability_score = local_score
         details["local_runability"] = local_details
         if local_score < 3:
             issues.append(f"Local runability concerns ({local_score}/5): {'; '.join([d for d in local_details if '✗' in d])}")
 
         # Metric 9: Deployability (DevX)
-        deploy_score, deploy_details = check_deployability(app_dir)
+        deploy_score, deploy_details = await check_deployability_agentic(
+            agent, resolved_app_dir, template, port=port + 100
+        )
         metrics.deployability_score = deploy_score
         details["deployability"] = deploy_details
         if deploy_score < 3:
@@ -925,7 +1118,7 @@ async def evaluate_app(app_dir: Path, prompt: str | None = None, port: int = 800
         )
 
         # Calculate efficiency metric from generation data if available
-        generation_metrics_file = app_dir / "generation_metrics.json"
+        generation_metrics_file = resolved_app_dir / "generation_metrics.json"
         if generation_metrics_file.exists():
             generation_metrics = json.loads(generation_metrics_file.read_text())
             tokens = generation_metrics.get("input_tokens", 0) + generation_metrics.get("output_tokens", 0)
@@ -941,13 +1134,13 @@ async def evaluate_app(app_dir: Path, prompt: str | None = None, port: int = 800
         # Add LOC count
         metrics.total_loc = sum(
             1
-            for f in app_dir.rglob("*.ts")
+            for f in resolved_app_dir.rglob("*.ts")
             if f.is_file() and "node_modules" not in str(f)
         )
 
     finally:
         # Always cleanup any running apps/containers
-        await _stop_app(agent, app_dir, template)
+        await _stop_app(agent, resolved_app_dir, template)
 
     print(f"\nIssues: {len(issues)}")
 

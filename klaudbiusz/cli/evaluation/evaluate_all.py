@@ -738,6 +738,64 @@ def filter_app_dirs(app_dirs: list[Path], args) -> list[Path]:
     return filtered
 
 
+def _looks_like_app_dir(directory: Path) -> bool:
+    """Heuristic: directory contains app-like markers."""
+    markers = [
+        "package.json",
+        "app.py",
+        "requirements.txt",
+        "pyproject.toml",
+        "Dockerfile",
+        "databricks.yml",
+        "server",
+        "client",
+        "src",
+    ]
+    return any((directory / marker).exists() for marker in markers)
+
+
+def _expand_collection_dirs(app_dirs: list[Path]) -> list[Path]:
+    """Expand bulk-run collection folders into contained app directories.
+
+    Some archives are organized as:
+      app-opencode-sonnet-databricks/
+        bulk_run_results_*.json
+        <many app folders>/
+
+    Evaluating the collection root causes agentic checks to run in the wrong folder.
+    """
+    expanded: list[Path] = []
+    excluded_dirs = {"logs", "node_modules", "__pycache__", ".git", "screenshot_output"}
+
+    for app_dir in app_dirs:
+        has_bulk_results = bool(list(app_dir.glob("bulk_run_results_*.json")))
+        child_dirs = [
+            d
+            for d in sorted(app_dir.iterdir())
+            if d.is_dir() and not d.name.startswith(".") and d.name not in excluded_dirs
+        ]
+        child_app_dirs = [d for d in child_dirs if _looks_like_app_dir(d)]
+
+        if has_bulk_results and child_app_dirs:
+            print(
+                f"🔎 '{app_dir.name}' is a collection folder; "
+                f"expanding to {len(child_app_dirs)} contained apps"
+            )
+            expanded.extend(child_app_dirs)
+        else:
+            expanded.append(app_dir)
+
+    # Keep deterministic order and remove duplicates by path.
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for d in expanded:
+        key = str(d.resolve())
+        if key not in seen:
+            seen.add(key)
+            deduped.append(d)
+    return deduped
+
+
 async def _save_results_and_log_mlflow(
     results: list,
     app_dirs: list,
@@ -982,8 +1040,25 @@ async def main_async():
         if d.is_dir() and not d.name.startswith(".") and d.name not in excluded_dirs
     ]
 
-    # Filter based on command-line arguments
-    app_dirs = filter_app_dirs(all_app_dirs, args)
+    # Apply name/pattern filtering first (on top-level directories).
+    top_level_filter_args = argparse.Namespace(**vars(args))
+    top_level_filter_args.skip = None
+    top_level_filter_args.limit = None
+    top_level_filter_args.start_from = None
+    app_dirs = filter_app_dirs(all_app_dirs, top_level_filter_args)
+
+    # Expand wrapper/collection dirs so each evaluation receives a real app folder.
+    app_dirs = _expand_collection_dirs(app_dirs)
+
+    # Apply windowing filters after expansion so --skip/--limit work on real app dirs.
+    post_expand_filter_args = argparse.Namespace(
+        apps=None,
+        pattern=None,
+        start_from=args.start_from,
+        skip=args.skip,
+        limit=args.limit,
+    )
+    app_dirs = filter_app_dirs(app_dirs, post_expand_filter_args)
 
     # Auto-detect CPU count if --parallel 0
     import os as os_module
