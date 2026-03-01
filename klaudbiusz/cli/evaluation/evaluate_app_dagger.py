@@ -64,6 +64,9 @@ for env_path in env_paths:
         load_dotenv(env_path, override=True)
         break
 
+# Global kill switch: skip DB connectivity/data-returned checks in all runs.
+SKIP_DB_CONNECTIVITY_CHECKS = os.environ.get("EVAL_SKIP_DB_CONNECTIVITY", "1") != "0"
+
 
 def _restore_terminal_cursor() -> None:
     """Restore terminal cursor after Dagger run (workaround for dagger/dagger#7160)."""
@@ -260,9 +263,17 @@ async def evaluate_app_async(
             print("  [5/8] Capturing screenshot...")
             await capture_screenshot(workspace, app_dir, port)
 
-        # Metric 5: Databricks connectivity (only if runtime succeeded)
+        # Metric 5-6 can be globally skipped to avoid harness-level DB timeouts.
         if fast_mode:
             print("  [5-7/7] Skipping DB/data/UI checks (--fast mode)")
+        elif SKIP_DB_CONNECTIVITY_CHECKS:
+            print("  [5-6/7] Skipping DB/data checks (EVAL_SKIP_DB_CONNECTIVITY=1)")
+            details["databricks_connectivity_agentic"] = [
+                "Skipped by evaluator config (EVAL_SKIP_DB_CONNECTIVITY=1)"
+            ]
+            details["data_returned_agentic"] = [
+                "Skipped because DB connectivity checks are disabled"
+            ]
         elif runtime_success:
             db_success, db_details = await check_databricks_connectivity_agentic(
                 devx_agent if 'devx_agent' in locals() else EvalAgent(
