@@ -1,9 +1,11 @@
 import asyncio
 import json
 import logging
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import coloredlogs
 import fire
@@ -31,20 +33,121 @@ class TrajectoryStep:
     tool_results: list[dict] | None
 
 
+def _stringify_tool_output(value: Any) -> str:
+    """Convert tool output to readable text."""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _extract_opencode_text(parts: list[dict[str, Any]]) -> str | None:
+    """Collect text/reasoning parts from OpenCode message format."""
+    chunks: list[str] = []
+    for part in parts:
+        if part.get("type") not in {"text", "reasoning"}:
+            continue
+        text = part.get("text")
+        if isinstance(text, str) and text.strip():
+            chunks.append(text.strip())
+    if not chunks:
+        return None
+    return "\n\n".join(chunks)
+
+
+def _parse_opencode_steps(data: dict[str, Any]) -> list[TrajectoryStep]:
+    """Parse one OpenCode JSONL message into normalized trajectory steps."""
+    info = data.get("info")
+    if not isinstance(info, dict):
+        return []
+    role = info.get("role")
+    if not isinstance(role, str):
+        return []
+
+    raw_parts = data.get("parts")
+    parts = raw_parts if isinstance(raw_parts, list) else []
+
+    tool_calls: list[dict[str, Any]] = []
+    tool_results: list[dict[str, Any]] = []
+    for part in parts:
+        if not isinstance(part, dict) or part.get("type") != "tool":
+            continue
+
+        state = part.get("state")
+        state_dict = state if isinstance(state, dict) else {}
+        tool_name = part.get("tool")
+        if not isinstance(tool_name, str):
+            continue
+
+        tool_input = state_dict.get("input")
+        call_args = tool_input if isinstance(tool_input, dict) else {}
+        tool_calls.append(
+            {
+                "id": part.get("callID") or part.get("id") or "",
+                "name": tool_name,
+                "arguments": call_args,
+            }
+        )
+
+        status = state_dict.get("status")
+        if status in {"completed", "error"}:
+            tool_results.append(
+                {
+                    "tool_call_id": part.get("callID") or part.get("id") or "",
+                    "content": _stringify_tool_output(state_dict.get("output", "")),
+                    "is_error": status == "error",
+                }
+            )
+
+    steps: list[TrajectoryStep] = [
+        TrajectoryStep(
+            role=role,
+            content=_extract_opencode_text(parts),
+            tool_calls=tool_calls or None,
+            tool_results=None,
+        )
+    ]
+
+    # Keep tool outputs visible in markdown using existing "tool" role section.
+    if tool_results:
+        steps.append(
+            TrajectoryStep(
+                role="tool",
+                content=None,
+                tool_calls=None,
+                tool_results=tool_results,
+            )
+        )
+
+    return steps
+
+
+def _parse_trajectory_line(data: dict[str, Any]) -> list[TrajectoryStep]:
+    """Parse one JSONL line from either Claude or OpenCode trajectory formats."""
+    role = data.get("role")
+    if isinstance(role, str):
+        return [
+            TrajectoryStep(
+                role=role,
+                content=data.get("content") if isinstance(data.get("content"), str) else None,
+                tool_calls=data.get("tool_calls") if isinstance(data.get("tool_calls"), list) else None,
+                tool_results=data.get("tool_results") if isinstance(data.get("tool_results"), list) else None,
+            )
+        ]
+
+    return _parse_opencode_steps(data)
+
+
 def load_trajectory(path: Path) -> list[TrajectoryStep]:
     """Load trajectory from JSONL file."""
-    steps = []
+    steps: list[TrajectoryStep] = []
     with path.open() as f:
         for line in f:
             data = json.loads(line)
-            steps.append(
-                TrajectoryStep(
-                    role=data["role"],
-                    content=data.get("content"),
-                    tool_calls=data.get("tool_calls"),
-                    tool_results=data.get("tool_results"),
-                )
-            )
+            if isinstance(data, dict):
+                steps.extend(_parse_trajectory_line(data))
     return steps
 
 
@@ -99,6 +202,11 @@ def format_trajectory_to_markdown(steps: list[TrajectoryStep]) -> str:
                     lines.append(content if isinstance(content, str) else str(content))
                     lines.append("```")
                     lines.append("")
+        elif step.role == "user":
+            if step.content:
+                lines.append("### User Input")
+                lines.append(step.content)
+                lines.append("")
 
         lines.append("---\n")
     return "\n".join(lines)
@@ -242,6 +350,25 @@ Key areas: packages/appkit-ui (React components), packages/appkit (server SDK), 
 
     task_description = "\n".join(categories)
 
+    # write large context to temp files to avoid hitting OS ARG_MAX limit
+    # (system_prompt is passed via CLI args/env to the subprocess)
+    analyses_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", prefix="trajectory_analyses_", delete=False
+    )
+    analyses_file.write(concatenated_analyses)
+    analyses_file.close()
+
+    extra_context_file = None
+    extra_context = f"{skills_section}{appkit_section}{eval_section}".strip()
+    extra_context_ref = ""
+    if extra_context:
+        extra_context_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".md", prefix="trajectory_extra_context_", delete=False
+        )
+        extra_context_file.write(extra_context)
+        extra_context_file.close()
+        extra_context_ref = f"\n\nAdditional context (skills, appkit, eval metrics) is in: {extra_context_file.name}\nRead this file first as well."
+
     base_instructions = f"""You are analyzing AI agent execution trajectories for a Databricks app generator.
 
 **Your task**: Provide actionable recommendations in these categories:
@@ -251,15 +378,11 @@ Key areas: packages/appkit-ui (React components), packages/appkit (server SDK), 
 - Focus on systemic issues, not one-off failures
 - Be specific: reference file paths, skill names, trajectory patterns
 - Format recommendations as markdown with clear sections
-- Only analyze context that has been explicitly provided below
+- Only analyze context that has been explicitly provided
 
----
+**IMPORTANT**: Start by reading the trajectory analyses file and any additional context files listed below.
 
-## Trajectory Analyses
-
-{concatenated_analyses}{skills_section}{appkit_section}{eval_section}
-
----
+Trajectory analyses are in: {analyses_file.name}{extra_context_ref}
 
 Analyze the data and provide your recommendations."""
 
@@ -267,7 +390,7 @@ Analyze the data and provide your recommendations."""
         system_prompt=base_instructions,
         permission_mode="bypassPermissions",
         disallowed_tools=disallowed_tools,
-        model="claude-opus-4-5",
+        model="claude-opus-4-6",
         allowed_tools=[
             "Read",
             "Glob",
@@ -277,34 +400,39 @@ Analyze the data and provide your recommendations."""
     )
 
     final_result: str | None = None
-    async for message in query(prompt="Analyze trajectories and provide recommendations.", options=options):
-        match message:
-            case AssistantMessage():
-                for block in message.content:
-                    match block:
-                        case TextBlock():
-                            text_preview = block.text[:200] if len(block.text) > 200 else block.text
-                            logger.info(f"💭 Agent: {text_preview}{'...' if len(block.text) > 200 else ''}")
-                        case ToolUseBlock():
-                            args = block.input or {}
-                            params = ", ".join(f"{k}={str(v)[:200]}" for k, v in args.items())
-                            truncated = params if len(params) <= 200 else params[:200] + "..."
-                            logger.info(f"🔧 Tool: {block.name}({truncated})")
-            case ResultMessage(result=result):
-                final_result = result
-                logger.info("✅ Agent completed analysis and produced final report")
-            case UserMessage():
-                for block in message.content:
-                    match block:
-                        case TextBlock():
-                            text_preview = block.text[:200] if len(block.text) > 200 else block.text
-                            logger.info(f"👤 User: {text_preview}{'...' if len(block.text) > 200 else ''}")
-                        case _:
-                            pass
-            case SystemMessage():
-                pass
-            case _:
-                logger.warning(f"Unknown message type: {type(message).__name__}")
+    try:
+        async for message in query(prompt="Analyze trajectories and provide recommendations.", options=options):
+            match message:
+                case AssistantMessage():
+                    for block in message.content:
+                        match block:
+                            case TextBlock():
+                                text_preview = block.text[:200] if len(block.text) > 200 else block.text
+                                logger.info(f"💭 Agent: {text_preview}{'...' if len(block.text) > 200 else ''}")
+                            case ToolUseBlock():
+                                args = block.input or {}
+                                params = ", ".join(f"{k}={str(v)[:200]}" for k, v in args.items())
+                                truncated = params if len(params) <= 200 else params[:200] + "..."
+                                logger.info(f"🔧 Tool: {block.name}({truncated})")
+                case ResultMessage(result=result):
+                    final_result = result
+                    logger.info("✅ Agent completed analysis and produced final report")
+                case UserMessage():
+                    for block in message.content:
+                        match block:
+                            case TextBlock():
+                                text_preview = block.text[:200] if len(block.text) > 200 else block.text
+                                logger.info(f"👤 User: {text_preview}{'...' if len(block.text) > 200 else ''}")
+                            case _:
+                                pass
+                case SystemMessage():
+                    pass
+                case _:
+                    logger.warning(f"Unknown message type: {type(message).__name__}")
+    finally:
+        Path(analyses_file.name).unlink(missing_ok=True)
+        if extra_context_file:
+            Path(extra_context_file.name).unlink(missing_ok=True)
 
     if final_result is None:
         raise RuntimeError("Agent did not produce a final report")
@@ -380,7 +508,7 @@ async def analyze_trajectories_async(
 def cli(
     skills_path: str | None = None,
     appkit_path: str | None = None,
-    trajectories_pattern: str = "./app/**/trajectory.jsonl",
+    trajectories_pattern: str = "./app-*/**/trajectory.jsonl",
     output_file: str = "",
     map_model: str = "anthropic/claude-haiku-4-5",
     eval_report: str | None = None,
